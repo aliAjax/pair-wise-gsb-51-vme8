@@ -47,8 +47,30 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    avg_monthly_income REAL NOT NULL,
+                    monthly_expenses REAL NOT NULL,
+                    new_debt_payment REAL NOT NULL,
+                    approved_payment REAL NOT NULL,
+                    affordability_ratio REAL NOT NULL,
+                    disposable_income REAL NOT NULL,
+                    recommendation TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    note TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    decided_by TEXT,
+                    decision TEXT,
+                    review_note TEXT NOT NULL DEFAULT '',
+                    decided_at TEXT,
+                    UNIQUE(record_id, seq)
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_reviews_record ON reviews(record_id, seq);
                 """
             )
 
@@ -141,6 +163,80 @@ class Repository:
         with self._connect() as connection:
             rows = connection.execute("SELECT state, COUNT(*) AS total FROM records GROUP BY state").fetchall()
         return {str(row["state"]): int(row["total"]) for row in rows}
+
+    @staticmethod
+    def _review_row(row: sqlite3.Row) -> Dict[str, Any]:
+        return dict(row)
+
+    def list_reviews(self, record_id: int) -> List[Dict[str, Any]]:
+        self.get(record_id)
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM reviews WHERE record_id=? ORDER BY seq", (record_id,)).fetchall()
+        return [self._review_row(row) for row in rows]
+
+    def get_review(self, record_id: int, review_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM reviews WHERE id=? AND record_id=?", (review_id, record_id)).fetchone()
+        if row is None:
+            raise NotFound("复评记录不存在")
+        return self._review_row(row)
+
+    def insert_review(self, record_id: int, review: Dict[str, Any], actor_id: str, record_version: int) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            exists = connection.execute("SELECT 1 FROM records WHERE id=?", (record_id,)).fetchone()
+            if exists is None:
+                connection.rollback()
+                raise NotFound("记录不存在")
+            row = connection.execute("SELECT COALESCE(MAX(seq), 0) AS max_seq FROM reviews WHERE record_id=?", (record_id,)).fetchone()
+            seq = int(row["max_seq"]) + 1
+            cursor = connection.execute(
+                """INSERT INTO reviews(record_id,seq,avg_monthly_income,monthly_expenses,new_debt_payment,
+                   approved_payment,affordability_ratio,disposable_income,recommendation,status,note,
+                   created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (record_id, seq, review["avg_monthly_income"], review["monthly_expenses"], review["new_debt_payment"],
+                 review["approved_payment"], review["affordability_ratio"], review["disposable_income"],
+                 review["recommendation"], "pending", review["note"], actor_id, now),
+            )
+            review_id = int(cursor.lastrowid)
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, "review", actor_id, record_version,
+                 json.dumps({"summary": "持续复评#%s：%s" % (seq, review["recommendation_label"]),
+                             "seq": seq, "review_id": review_id, "affordability_ratio": review["affordability_ratio"],
+                             "recommendation": review["recommendation"], "status": "pending"},
+                            ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+            connection.commit()
+        return self._review_row(result)
+
+    def decide_review(self, record_id: int, review_id: int, decision: str, review_note: str, actor_id: str, record_version: int, summary: str) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM reviews WHERE id=? AND record_id=?", (review_id, record_id)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("复评记录不存在")
+            if row["status"] != "pending":
+                connection.rollback()
+                raise Conflict("该复评已经复核完成")
+            connection.execute(
+                "UPDATE reviews SET status='confirmed',decision=?,decided_by=?,review_note=?,decided_at=? WHERE id=?",
+                (decision, actor_id, review_note, now, review_id),
+            )
+            connection.execute(
+                "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, "review_decision", actor_id, record_version,
+                 json.dumps({"summary": summary, "seq": row["seq"], "review_id": review_id, "decision": decision,
+                             "recommendation": row["recommendation"]}, ensure_ascii=False, sort_keys=True), now),
+            )
+            result = connection.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+            connection.commit()
+        return self._review_row(result)
 
     def health(self) -> bool:
         try:

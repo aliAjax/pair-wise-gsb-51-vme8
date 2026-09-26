@@ -67,6 +67,36 @@ class Service:
         self._ensure_known_role(actor)
         return self.audit.timeline(record_id)
 
+    def submit_review(self, actor: Actor, record_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._actor(actor)
+        self._ensure_known_role(actor)
+        if not self.rules.role_can_action(actor.role, "submit_review"):
+            raise PermissionDenied("角色无权录入复评")
+        record = self.repository.get(record_id)
+        self.rules.require_reviewable(record)
+        reviews = self.repository.list_reviews(record_id)
+        previous_ratio = reviews[-1]["affordability_ratio"] if reviews else None
+        prepared = self.rules.prepare_review(data or {}, record["payload"]["approved_payment"], previous_ratio)
+        return self.repository.insert_review(record_id, prepared, actor.user_id, record["version"])
+
+    def list_reviews(self, actor: Actor, record_id: int) -> List[Dict[str, Any]]:
+        actor = self._actor(actor)
+        self._ensure_known_role(actor)
+        return self.repository.list_reviews(record_id)
+
+    def decide_review(self, actor: Actor, record_id: int, review_id: int, data: Dict[str, Any]) -> Dict[str, Any]:
+        actor = self._actor(actor)
+        self._ensure_known_role(actor)
+        if not self.rules.role_can_action(actor.role, "decide_review"):
+            raise PermissionDenied("角色无权确认复评")
+        decision, review_note = self.rules.validate_review_decision(data or {})
+        review = self.repository.get_review(record_id, review_id)
+        record = self.repository.get(record_id)
+        summary = self.rules.review_decision_summary(review["recommendation"], decision)
+        return self.repository.decide_review(
+            record_id, review_id, decision, review_note, actor.user_id, record["version"], summary
+        )
+
     def stats(self, actor: Actor) -> Dict[str, int]:
         actor = self._actor(actor)
         self._ensure_known_role(actor)

@@ -5,29 +5,293 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>住房贷款纾困申请与履约跟踪</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
-    main { max-width: 960px; margin: auto; }
-    button { padding: .55rem .9rem; cursor: pointer; }
-    pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; background: #f7f8fa; }
+    main { max-width: 1000px; margin: auto; }
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1.05rem; margin: 1.4rem 0 .6rem; }
+    button { padding: .5rem .85rem; cursor: pointer; border: 1px solid #2f6fed; background: #2f6fed; color: #fff; border-radius: 6px; font-size: .9rem; }
+    button.secondary { background: #fff; color: #2f6fed; }
+    button.ghost { background: #fff; color: #44505e; border-color: #c4ccd6; }
+    button:disabled { opacity: .5; cursor: default; }
+    input { padding: .45rem .55rem; border: 1px solid #c4ccd6; border-radius: 6px; font-size: .9rem; width: 8.5rem; }
+    .toolbar { display: flex; gap: .7rem; flex-wrap: wrap; margin-bottom: 1rem; }
+    .panel { background: #fff; border: 1px solid #e3e8ef; border-radius: 10px; padding: 1rem 1.2rem; margin-bottom: 1rem; }
+    table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+    th, td { text-align: left; padding: .45rem .6rem; border-bottom: 1px solid #eef1f5; }
+    tr.clickable { cursor: pointer; }
+    tr.clickable:hover { background: #f0f5ff; }
+    .state { display: inline-block; padding: .1rem .55rem; border-radius: 999px; font-size: .8rem; background: #eef1f5; }
+    .state.active { background: #e6f4ea; color: #1e7c3a; }
+    .badge { display: inline-block; padding: .15rem .6rem; border-radius: 999px; font-size: .82rem; }
+    .badge.extend { background: #fdecea; color: #b3261e; }
+    .badge.exit { background: #e8f0fe; color: #174ea6; }
+    .badge.none { background: #eef1f5; color: #44505e; }
+    .ratio-high { color: #b3261e; font-weight: 600; }
+    .ratio-low { color: #174ea6; font-weight: 600; }
+    .review { border: 1px solid #e3e8ef; border-radius: 10px; padding: .8rem 1rem; margin-bottom: .7rem; background: #fff; }
+    .review.pending { border-left: 4px solid #e8a33d; }
+    .review.confirmed { border-left: 4px solid #2f9e57; }
+    .review-head { display: flex; justify-content: space-between; gap: .6rem; flex-wrap: wrap; align-items: center; }
+    .muted { color: #6b7684; font-size: .82rem; }
+    .form-row { display: flex; gap: .8rem; flex-wrap: wrap; align-items: end; margin: .6rem 0; }
+    label { font-size: .82rem; color: #44505e; display: flex; flex-direction: column; gap: .25rem; }
+    #msg { font-size: .88rem; margin: .5rem 0; min-height: 1.2em; }
+    #msg.error { color: #b3261e; }
+    #msg.ok { color: #1e7c3a; }
+    pre { background: #f4f6f8; padding: .8rem; overflow: auto; border-radius: 8px; font-size: .8rem; }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
 <main>
-  <h1>住房贷款纾困申请与履约跟踪</h1>
-  <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
-  <pre id="output">点击上方按钮读取服务状态。</pre>
+  <h1>住房贷款纾困申请与履约跟踪 · 持续复评</h1>
+  <p class="muted">服务人员录入最近三个月月均收入、家庭支出和新增债务月供；系统按批准月供计算承受比例。连续两次高于 40% 建议展期，低于 25% 建议退出纾困；复核岗确认前原方案照常履约。</p>
+
+  <div class="toolbar">
+    <button id="load">加载记录</button>
+    <button id="demo" class="secondary">创建并激活演示记录</button>
+    <button id="stats" class="ghost">状态统计</button>
+  </div>
+  <div id="msg"></div>
+
+  <div class="panel">
+    <h2 style="margin-top:0">记录列表</h2>
+    <table>
+      <thead><tr><th>ID</th><th>引用</th><th>状态</th><th>版本</th><th>批准月供</th></tr></thead>
+      <tbody id="records"><tr><td colspan="5" class="muted">点击“加载记录”。</td></tr></tbody>
+    </table>
+  </div>
+
+  <div id="detail" class="hidden"></div>
+  <pre id="raw" class="hidden"></pre>
 </main>
 <script>
-const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
-  const data = await response.json();
-  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+const USERS = {
+  intake: {userId: "demo-intake", role: "intake_officer"},
+  underwriter: {userId: "demo-underwriter", role: "underwriter"},
+  servicer: {userId: "demo-servicer", role: "servicer"},
+  reviewer: {userId: "demo-reviewer", role: "reviewer"},
+};
+const RECOMMENDATION = {extend: "建议展期", exit: "建议退出纾困", none: "继续按原方案履约"};
+const DECISION = {adopt: "采纳建议", keep: "维持原方案"};
+const CREATE_DATA = {monthly_income: 18000, monthly_expenses: 9000, monthly_payment: 7000,
+  arrears: 12000, hardship_factor: 0.5, program_type: "reduction", requested_months: 9};
+
+const msg = document.getElementById("msg");
+function notify(text, ok=false) { msg.textContent = text; msg.className = ok ? "ok" : "error"; }
+function el(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) node.className = className;
+  if (text !== undefined && text !== null) node.textContent = text;
+  return node;
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
-document.getElementById("stats").onclick = () => show("/api/stats");
+async function api(path, {method="GET", body=null, user=USERS.servicer}={}) {
+  const headers = {"X-User-Id": user.userId, "X-Role": user.role};
+  if (body) headers["Content-Type"] = "application/json";
+  const response = await fetch(path, {method, headers, body: body ? JSON.stringify(body) : null});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || ("请求失败 " + response.status));
+  return data;
+}
+const pct = v => (v * 100).toFixed(1) + "%";
+const fmtTime = s => s ? s.replace("T", " ").replace(/\.\d+.*$/, "") : "";
+
+async function loadList(selectId=null) {
+  const data = await api("/api/records?limit=50", {user: USERS.reviewer});
+  const tbody = document.getElementById("records");
+  tbody.textContent = "";
+  if (!data.items.length) {
+    tbody.appendChild(el("tr")).appendChild(el("td", "muted", "暂无记录。"));
+    return;
+  }
+  for (const r of data.items) {
+    const tr = el("tr", "clickable");
+    tr.appendChild(el("td", null, String(r.id)));
+    tr.appendChild(el("td", null, r.reference));
+    tr.appendChild(el("td")).appendChild(el("span", "state " + r.state, r.state));
+    tr.appendChild(el("td", null, String(r.version)));
+    tr.appendChild(el("td", null, r.payload.approved_payment !== undefined ? r.payload.approved_payment : "—"));
+    tr.onclick = () => openRecord(r.id);
+    tbody.appendChild(tr);
+  }
+  if (selectId) openRecord(selectId);
+}
+
+async function createDemo() {
+  try {
+    const ref = "MORT-DEMO-" + Date.now().toString().slice(-6);
+    const record = await api("/api/records", {method: "POST", body: {reference: ref, data: CREATE_DATA}, user: USERS.intake});
+    let current = record;
+    current = await api(`/api/records/${current.id}/actions/assess`,
+      {method: "POST", body: {expected_version: current.version, data: {assessment_note: "收入波动，符合纾困条件"}}, user: USERS.intake});
+    current = await api(`/api/records/${current.id}/actions/approve`,
+      {method: "POST", body: {expected_version: current.version, data: {exception_approved: false}}, user: USERS.underwriter});
+    current = await api(`/api/records/${current.id}/actions/activate`,
+      {method: "POST", body: {expected_version: current.version, data: {borrower_ack: true}}, user: USERS.servicer});
+    notify("演示记录 " + ref + " 已激活（ID " + current.id + "）", true);
+    await loadList(current.id);
+  } catch (err) { notify(err.message); }
+}
+
+async function openRecord(id) {
+  try {
+    const [record, reviews, timeline] = await Promise.all([
+      api(`/api/records/${id}`, {user: USERS.reviewer}),
+      api(`/api/records/${id}/reviews`, {user: USERS.reviewer}),
+      api(`/api/records/${id}/audit`, {user: USERS.reviewer}),
+    ]);
+    renderDetail(record, reviews.items, timeline.items);
+  } catch (err) { notify(err.message); }
+}
+
+function renderDetail(record, reviews, timeline) {
+  const detail = document.getElementById("detail");
+  detail.className = "";
+  detail.textContent = "";
+
+  const head = el("div", "panel");
+  head.appendChild(el("h2", null, "记录 #" + record.id + " · " + record.reference));
+  const meta = el("p");
+  meta.appendChild(el("span", "state " + record.state, record.state));
+  meta.appendChild(el("span", "muted", "　版本 " + record.version + "　批准月供 " +
+    (record.payload.approved_payment !== undefined ? record.payload.approved_payment : "—") +
+    "　纾困类型 " + record.payload.program_type));
+  head.appendChild(meta);
+
+  if (record.state === "active") head.appendChild(reviewForm(record.id));
+  detail.appendChild(head);
+
+  const list = el("div", "panel");
+  list.appendChild(el("h2", null, "持续复评时间线（按时间顺序）"));
+  if (!reviews.length) {
+    list.appendChild(el("p", "muted", "尚无复评。生效中的方案可在上方录入。"));
+  } else {
+    for (const rv of reviews) list.appendChild(reviewCard(record.id, rv));
+  }
+  detail.appendChild(list);
+
+  const audit = el("div", "panel");
+  audit.appendChild(el("h2", null, "审计事件"));
+  for (const ev of timeline) {
+    const line = el("p", "muted");
+    const summary = ev.details && ev.details.summary ? ev.details.summary : "";
+    line.textContent = "#" + ev.version + " " + fmtTime(ev.created_at) + " [" + ev.actor_id + "] " + ev.action +
+      (summary ? " — " + summary : "");
+    audit.appendChild(line);
+  }
+  detail.appendChild(audit);
+}
+
+function reviewForm(recordId) {
+  const box = el("div");
+  box.appendChild(el("p", "muted", "服务人员（servicer）录入最近三个月数据，提交后等待复核岗（reviewer）确认。"));
+  const row = el("div", "form-row");
+  const income = labeledInput("最近三个月月均收入", "8000");
+  const expenses = labeledInput("家庭月均支出", "3000");
+  const newDebt = labeledInput("新增债务月供", "0");
+  const noteWrap = el("label");
+  noteWrap.appendChild(el("span", null, "备注"));
+  const note = el("input"); note.style.width = "14rem"; note.placeholder = "选填";
+  noteWrap.appendChild(note);
+  row.appendChild(income.label); row.appendChild(expenses.label); row.appendChild(newDebt.label); row.appendChild(noteWrap);
+  const submit = el("button", null, "提交复评");
+  row.appendChild(submit);
+  box.appendChild(row);
+  submit.onclick = async () => {
+    try {
+      const data = {avg_monthly_income: Number(income.input.value), monthly_expenses: Number(expenses.input.value),
+        new_debt_payment: Number(newDebt.input.value)};
+      if (note.value.trim()) data.note = note.value.trim();
+      await api(`/api/records/${recordId}/reviews`, {method: "POST", body: {data}, user: USERS.servicer});
+      notify("复评已提交，等待复核岗确认；原方案继续照常履约。", true);
+      await openRecord(recordId);
+    } catch (err) { notify(err.message); }
+  };
+  return box;
+}
+
+function labeledInput(textValue, placeholder) {
+  const label = el("label");
+  label.appendChild(el("span", null, textValue));
+  const input = el("input");
+  input.type = "number"; input.min = "0"; input.step = "100"; input.placeholder = placeholder;
+  label.appendChild(input);
+  return {label, input};
+}
+
+function reviewCard(recordId, rv) {
+  const card = el("div", "review " + rv.status);
+  const head = el("div", "review-head");
+  const left = el("div");
+  left.appendChild(el("strong", null, "第 " + rv.seq + " 次复评"));
+  left.appendChild(el("span", "muted", "　" + fmtTime(rv.created_at) + "　录入人 " + rv.created_by));
+  head.appendChild(left);
+  const right = el("div");
+  const ratioClass = rv.affordability_ratio > 0.4 ? "ratio-high" : (rv.affordability_ratio < 0.25 ? "ratio-low" : "");
+  right.appendChild(el("span", ratioClass, "承受比例 " + pct(rv.affordability_ratio)));
+  right.appendChild(document.createTextNode("　"));
+  right.appendChild(el("span", "badge " + rv.recommendation, RECOMMENDATION[rv.recommendation]));
+  right.appendChild(document.createTextNode("　"));
+  right.appendChild(el("span", "state", rv.status === "pending" ? "待复核" : "已复核"));
+  head.appendChild(right);
+  card.appendChild(head);
+
+  const table = el("table");
+  const tbody = el("tbody");
+  const rows = [
+    ["最近三个月月均收入", rv.avg_monthly_income], ["家庭月均支出", rv.monthly_expenses],
+    ["新增债务月供", rv.new_debt_payment], ["批准月供（基准）", rv.approved_payment],
+    ["可支配余额", rv.disposable_income], ["备注", rv.note || "—"],
+  ];
+  for (const [k, v] of rows) {
+    const tr = el("tr");
+    tr.appendChild(el("td", "muted", k)); tr.appendChild(el("td", null, String(v)));
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  card.appendChild(table);
+
+  if (rv.status === "confirmed") {
+    const line = el("p", "muted");
+    line.textContent = "复核结果：" + (DECISION[rv.decision] || rv.decision) + "，复核人 " + rv.decided_by +
+      "，" + fmtTime(rv.decided_at) + (rv.review_note ? "；意见：" + rv.review_note : "");
+    card.appendChild(line);
+  } else {
+    const actions = el("div", "form-row");
+    const noteWrap = el("label");
+    noteWrap.appendChild(el("span", null, "复核意见（选填）"));
+    const noteInput = el("input"); noteInput.style.width = "14rem";
+    noteWrap.appendChild(noteInput);
+    actions.appendChild(noteWrap);
+    const adopt = el("button", null, "采纳建议");
+    const keep = el("button", "secondary", "维持原方案");
+    actions.appendChild(adopt); actions.appendChild(keep);
+    card.appendChild(actions);
+    const decide = async decision => {
+      try {
+        const data = {decision};
+        if (noteInput.value.trim()) data.review_note = noteInput.value.trim();
+        await api(`/api/records/${recordId}/reviews/${rv.id}/decision`,
+          {method: "POST", body: {data}, user: USERS.reviewer});
+        notify("复核完成（" + (DECISION[decision]) + "）。", true);
+        await openRecord(recordId);
+      } catch (err) { notify(err.message); }
+    };
+    adopt.onclick = () => decide("adopt");
+    keep.onclick = () => decide("keep");
+  }
+  return card;
+}
+
+document.getElementById("load").onclick = () => loadList().catch(err => notify(err.message));
+document.getElementById("demo").onclick = createDemo;
+document.getElementById("stats").onclick = async () => {
+  try {
+    const data = await api("/api/stats", {user: USERS.reviewer});
+    notify("状态统计：" + Object.entries(data).map(([k, v]) => k + "=" + v).join("，"), true);
+  } catch (err) { notify(err.message); }
+};
+loadList().catch(() => {});
 </script>
 </body>
 </html>

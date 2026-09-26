@@ -1,12 +1,16 @@
 """住房贷款纾困申请与履约跟踪领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, optional_text, text, text_list
 
 
 INITIAL_STATE = "submitted"
 CREATE_ROLES = {'intake_officer'}
-ACTION_ROLES = {'assess': {'intake_officer'}, 'approve': {'underwriter'}, 'activate': {'servicer'}, 'cure': {'servicer'}, 'default': {'servicer'}}
+ACTION_ROLES = {'assess': {'intake_officer'}, 'approve': {'underwriter'}, 'activate': {'servicer'}, 'cure': {'servicer'}, 'default': {'servicer'}, 'submit_review': {'servicer'}, 'decide_review': {'reviewer'}}
+
+REVIEW_EXTEND_RATIO = 0.4
+REVIEW_EXIT_RATIO = 0.25
+RECOMMENDATION_LABELS = {'extend': '建议展期', 'exit': '建议退出纾困', 'none': '继续按原方案履约'}
 TRANSITIONS = {'assess': {'submitted': 'assessed'}, 'approve': {'assessed': 'approved'}, 'activate': {'approved': 'active'}, 'cure': {'active': 'cured'}, 'default': {'active': 'defaulted'}}
 
 
@@ -102,3 +106,52 @@ class DomainRules:
             summary = "纾困方案违约"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    def prepare_review(self, payload: Dict[str, Any], approved_payment: float, previous_ratio: Optional[float]) -> Dict[str, Any]:
+        """根据最近三个月月均收入等数据计算承受比例与复评建议。"""
+        income = number(payload, "avg_monthly_income", 1)
+        expenses = number(payload, "monthly_expenses", 0)
+        new_debt_payment = number(payload, "new_debt_payment", 0)
+        note = optional_text(payload, "note")
+        approved_payment = float(approved_payment)
+        ratio = approved_payment / income
+        disposable = income - expenses - new_debt_payment
+        if ratio < REVIEW_EXIT_RATIO:
+            recommendation = "exit"
+        elif ratio > REVIEW_EXTEND_RATIO and previous_ratio is not None and previous_ratio > REVIEW_EXTEND_RATIO:
+            recommendation = "extend"
+        else:
+            recommendation = "none"
+        return {
+            "avg_monthly_income": round(income, 2),
+            "monthly_expenses": round(expenses, 2),
+            "new_debt_payment": round(new_debt_payment, 2),
+            "approved_payment": round(approved_payment, 2),
+            "affordability_ratio": round(ratio, 4),
+            "disposable_income": round(disposable, 2),
+            "recommendation": recommendation,
+            "recommendation_label": RECOMMENDATION_LABELS[recommendation],
+            "note": note,
+        }
+
+    def require_reviewable(self, record: Dict[str, Any]) -> None:
+        if record["state"] != "active":
+            raise Conflict("仅生效中的纾困方案可以复评")
+        approved_payment = record["payload"].get("approved_payment")
+        if approved_payment is None:
+            raise Conflict("方案尚未批准月供，无法复评")
+        return None
+
+    def validate_review_decision(self, data: Dict[str, Any]) -> Tuple[str, str]:
+        decision = choice(data, "decision", ["adopt", "keep"])
+        note = optional_text(data, "review_note")
+        return decision, note
+
+    def review_decision_summary(self, recommendation: str, decision: str) -> str:
+        if decision == "keep":
+            return "复核岗确认维持原方案"
+        if recommendation == "extend":
+            return "复核岗采纳建议，安排展期"
+        if recommendation == "exit":
+            return "复核岗采纳建议，启动退出纾困"
+        return "复核岗已确认复评"
