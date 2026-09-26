@@ -1,4 +1,5 @@
 """领域基础类型与输入校验。"""
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -56,6 +57,8 @@ def number(data: Dict[str, Any], key: str, minimum: float = None, maximum: float
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValidationError("%s必须是数字" % key)
     value = float(value)
+    if not math.isfinite(value):
+        raise ValidationError("%s必须是有限数字" % key)
     if minimum is not None and value < minimum:
         raise ValidationError("%s不能小于%s" % (key, minimum))
     if maximum is not None and value > maximum:

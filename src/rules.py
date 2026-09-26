@@ -1,7 +1,7 @@
 """住房贷款纾困申请与履约跟踪领域规则与状态转换。"""
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
-from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, text, text_list
+from .domain import Actor, Conflict, ValidationError, boolean, choice, integer, number, optional_text, text, text_list
 
 
 INITIAL_STATE = "submitted"
@@ -9,12 +9,20 @@ CREATE_ROLES = {'intake_officer'}
 ACTION_ROLES = {'assess': {'intake_officer'}, 'approve': {'underwriter'}, 'activate': {'servicer'}, 'cure': {'servicer'}, 'default': {'servicer'}}
 TRANSITIONS = {'assess': {'submitted': 'assessed'}, 'approve': {'assessed': 'approved'}, 'activate': {'approved': 'active'}, 'cure': {'active': 'cured'}, 'default': {'active': 'defaulted'}}
 
+# 存续期复评：服务人员录入、复核岗确认，确认前原方案照常履约
+REVIEW_SUBMIT_ROLES = {'servicer'}
+REVIEW_DECIDE_ROLES = {'reviewer'}
+REVIEW_HIGH_RATIO = 0.4
+REVIEW_LOW_RATIO = 0.25
+REVIEW_SUGGESTIONS = {'extend': '建议展期', 'exit': '建议退出纾困', 'maintain': '维持原方案'}
+REVIEW_DECISIONS = ['confirmed', 'rejected']
+
 
 class DomainRules:
     INITIAL_STATE = INITIAL_STATE
 
     def known_role(self, role: str) -> bool:
-        all_roles = set(CREATE_ROLES)
+        all_roles = set(CREATE_ROLES) | REVIEW_SUBMIT_ROLES | REVIEW_DECIDE_ROLES
         for roles in ACTION_ROLES.values():
             all_roles.update(roles)
         return role == "admin" or role in all_roles
@@ -102,3 +110,52 @@ class DomainRules:
             summary = "纾困方案违约"
         p.update(changes)
         return new_state, p, summary or ("已执行%s" % action)
+
+    def role_can_submit_review(self, role: str) -> bool:
+        return role == "admin" or role in REVIEW_SUBMIT_ROLES
+
+    def role_can_decide_review(self, role: str) -> bool:
+        return role == "admin" or role in REVIEW_DECIDE_ROLES
+
+    def validate_review(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        data = dict(data or {})
+        return {
+            "monthly_income": number(data, "monthly_income", 0),
+            "household_expenses": number(data, "household_expenses", 0),
+            "new_debt_payment": number(data, "new_debt_payment", 0),
+            "note": optional_text(data, "note"),
+        }
+
+    def validate_review_decision(self, decision: Any, note: Any) -> Tuple[str, str]:
+        decision = choice({"decision": decision}, "decision", REVIEW_DECISIONS)
+        return decision, optional_text({"note": note}, "note")
+
+    def assess_review(self, approved_payment: float, monthly_income: float, last_review: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """按批准的月供计算承受比例，连续两次高于四成建议展期，低于两成五建议退出纾困。"""
+        approved_payment = float(approved_payment)
+        if monthly_income > 0:
+            raw_ratio = approved_payment / monthly_income
+            burden_ratio = round(raw_ratio, 4)
+            high = raw_ratio > REVIEW_HIGH_RATIO
+        else:
+            burden_ratio = None
+            high = True
+        previous = int(last_review["consecutive_high"]) if last_review else 0
+        consecutive_high = previous + 1 if high else 0
+        if high and consecutive_high >= 2:
+            suggestion = "extend"
+        elif burden_ratio is not None and burden_ratio < REVIEW_LOW_RATIO:
+            suggestion = "exit"
+        else:
+            suggestion = "maintain"
+        return {"approved_payment": approved_payment, "burden_ratio": burden_ratio, "consecutive_high": consecutive_high, "suggestion": suggestion}
+
+    def suggestion_label(self, suggestion: str) -> str:
+        return REVIEW_SUGGESTIONS.get(suggestion, suggestion)
+
+    def review_summary(self, review: Dict[str, Any]) -> str:
+        if review["burden_ratio"] is None:
+            ratio_text = "收入为零，承受比例按超限处理"
+        else:
+            ratio_text = "承受比例%.1f%%" % (float(review["burden_ratio"]) * 100)
+        return "第%s次复评：%s，%s" % (review["seq"], ratio_text, self.suggestion_label(review["suggestion"]))

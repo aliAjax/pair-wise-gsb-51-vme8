@@ -6,28 +6,183 @@
   <title>住房贷款纾困申请与履约跟踪</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #17212b; }
-    main { max-width: 960px; margin: auto; }
+    main { max-width: 1080px; margin: auto; }
     button { padding: .55rem .9rem; cursor: pointer; }
+    input, select { padding: .45rem .6rem; }
     pre { background: #f4f6f8; padding: 1rem; overflow: auto; border-radius: 8px; }
-    .row { display: flex; gap: 1rem; align-items: center; }
+    .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+    table { border-collapse: collapse; width: 100%; margin: .5rem 0 1rem; font-size: .92rem; }
+    th, td { border: 1px solid #d7dee6; padding: .4rem .55rem; text-align: left; }
+    th { background: #eef2f6; }
+    tr.record-row { cursor: pointer; }
+    tr.record-row:hover { background: #f0f5fb; }
+    section { margin-top: 1.5rem; }
+    .tag { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .85rem; white-space: nowrap; }
+    .tag-extend { background: #fde2e2; color: #9b1c1c; }
+    .tag-exit { background: #e0f2e9; color: #14532d; }
+    .tag-maintain { background: #e8eef7; color: #1f3b66; }
+    .tag-pending { background: #fff4d6; color: #8a5a00; }
+    .tag-confirmed { background: #e0f2e9; color: #14532d; }
+    .tag-rejected { background: #f0f1f3; color: #555; }
+    ul.timeline { padding-left: 1.2rem; line-height: 1.7; }
+    .hint { color: #5a6a7a; font-size: .9rem; }
   </style>
 </head>
 <body>
 <main>
   <h1>住房贷款纾困申请与履约跟踪</h1>
-  <p>最小演示页。完整业务流程通过README中的JSON接口调用。</p>
-  <div class="row"><button id="load">加载记录</button><button id="stats">查看状态统计</button></div>
+  <p>演示页：选择身份后加载记录，点击记录查看详情；生效中的方案可录入复评，复核岗在复评时间线中确认或驳回建议。</p>
+  <section class="row">
+    <label>用户 <input id="user" value="demo-servicer"></label>
+    <label>角色
+      <select id="role">
+        <option value="servicer">servicer（服务人员）</option>
+        <option value="reviewer">reviewer（复核岗）</option>
+        <option value="admin">admin</option>
+        <option value="intake_officer">intake_officer</option>
+        <option value="underwriter">underwriter</option>
+      </select>
+    </label>
+    <button id="load">加载记录</button>
+    <button id="stats">状态统计</button>
+    <button id="seed">生成演示记录</button>
+  </section>
+  <section>
+    <h2>记录列表</h2>
+    <div id="records">尚未加载。</div>
+  </section>
+  <section id="detail" style="display:none">
+    <h2>记录详情 <span id="detail-title"></span></h2>
+    <pre id="record-json"></pre>
+    <h3>复评时间线</h3>
+    <div id="reviews"></div>
+    <div id="review-form-box"></div>
+    <h3>审计时间线</h3>
+    <div id="audit"></div>
+  </section>
   <pre id="output">点击上方按钮读取服务状态。</pre>
 </main>
 <script>
-const headers = {"X-User-Id":"demo-admin","X-Role":"admin","X-Org":"demo"};
-async function show(path) {
-  const response = await fetch(path, {headers});
-  const data = await response.json();
-  document.getElementById("output").textContent = JSON.stringify(data, null, 2);
+const SUGGESTION_LABELS = {extend: "建议展期", exit: "建议退出纾困", maintain: "维持原方案"};
+const STATUS_LABELS = {pending: "待复核", confirmed: "已确认", rejected: "已驳回"};
+const $ = id => document.getElementById(id);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+let currentRecord = null;
+
+function headers() {
+  return {"X-User-Id": $("user").value.trim() || "demo", "X-Role": $("role").value, "X-Org": "demo", "Content-Type": "application/json"};
 }
-document.getElementById("load").onclick = () => show("/api/records?limit=20");
-document.getElementById("stats").onclick = () => show("/api/stats");
+async function api(path, options) {
+  const response = await fetch(path, Object.assign({headers: headers()}, options || {}));
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.message || ("HTTP " + response.status));
+  return data;
+}
+function showError(e) { $("output").textContent = "操作失败：" + e.message; }
+function showOutput(data) { $("output").textContent = typeof data === "string" ? data : JSON.stringify(data, null, 2); }
+
+async function loadRecords() {
+  try {
+    const data = await api("/api/records?limit=20");
+    if (!data.items.length) { $("records").textContent = "暂无记录。"; return; }
+    $("records").innerHTML = "<table><tr><th>ID</th><th>引用</th><th>状态</th><th>版本</th><th>更新时间</th></tr>" +
+      data.items.map(r => `<tr class="record-row" data-id="${r.id}"><td>${r.id}</td><td>${esc(r.reference)}</td><td>${esc(r.state)}</td><td>${r.version}</td><td>${esc(r.updated_at)}</td></tr>`).join("") + "</table>";
+    document.querySelectorAll(".record-row").forEach(row => row.onclick = () => showRecord(row.dataset.id));
+  } catch (e) { showError(e); }
+}
+
+async function showRecord(id) {
+  try {
+    const record = await api("/api/records/" + id);
+    currentRecord = record;
+    const audit = await api("/api/records/" + id + "/audit");
+    $("detail").style.display = "block";
+    $("detail-title").textContent = "#" + record.id + " " + record.reference;
+    const copy = Object.assign({}, record);
+    delete copy.reviews;
+    $("record-json").textContent = JSON.stringify(copy, null, 2);
+    renderReviews(record);
+    renderAudit(audit.items);
+  } catch (e) { showError(e); }
+}
+
+function renderReviews(record) {
+  const reviews = record.reviews || [];
+  if (!reviews.length) {
+    $("reviews").innerHTML = "<p class='hint'>暂无复评记录。</p>";
+  } else {
+    $("reviews").innerHTML = "<table><tr><th>#</th><th>时间</th><th>月均收入</th><th>家庭支出</th><th>新增债务月供</th><th>批准月供</th><th>承受比例</th><th>连续超限</th><th>建议</th><th>状态</th><th>复核结果</th><th>操作</th></tr>" +
+      reviews.map(r => {
+        const ratio = r.burden_ratio === null ? "收入为0，按超限处理" : (r.burden_ratio * 100).toFixed(1) + "%";
+        const decided = r.status === "pending" ? "—" : `${esc(r.decided_by)} @ ${esc(r.decided_at)}${r.decision_note ? "：" + esc(r.decision_note) : ""}`;
+        const ops = r.status === "pending"
+          ? `<button onclick="decideReview(${r.id}, 'confirmed')">确认建议</button> <button onclick="decideReview(${r.id}, 'rejected')">驳回</button>`
+          : "";
+        return `<tr><td>${r.seq}</td><td>${esc(r.created_at)}</td><td>${r.monthly_income}</td><td>${r.household_expenses}</td><td>${r.new_debt_payment}</td><td>${r.approved_payment}</td><td>${ratio}</td><td>${r.consecutive_high}</td>` +
+          `<td><span class="tag tag-${r.suggestion}">${SUGGESTION_LABELS[r.suggestion] || esc(r.suggestion)}</span></td>` +
+          `<td><span class="tag tag-${r.status}">${STATUS_LABELS[r.status] || esc(r.status)}</span></td><td>${decided}</td><td>${ops}</td></tr>`;
+      }).join("") + "</table>";
+  }
+  if (record.state === "active") {
+    $("review-form-box").innerHTML = `<h3>录入复评（服务人员）</h3>
+      <div class="row">
+        <label>最近三个月月均收入 <input id="rv-income" type="number" min="0" step="0.01"></label>
+        <label>家庭支出 <input id="rv-expenses" type="number" min="0" step="0.01"></label>
+        <label>新增债务月供 <input id="rv-debt" type="number" min="0" step="0.01" value="0"></label>
+        <label>备注 <input id="rv-note" type="text"></label>
+        <button onclick="submitReview()">提交复评</button>
+      </div>
+      <p class="hint">承受比例 = 批准月供 / 最近三个月月均收入；连续两次高于四成就建议展期，低于两成五建议退出纾困；复核岗确认前原方案照常履约。</p>`;
+  } else {
+    $("review-form-box").innerHTML = "<p class='hint'>仅生效中（active）的方案可录入复评。</p>";
+  }
+}
+
+async function submitReview() {
+  try {
+    const data = {
+      monthly_income: parseFloat($("rv-income").value),
+      household_expenses: parseFloat($("rv-expenses").value),
+      new_debt_payment: parseFloat($("rv-debt").value || "0"),
+      note: $("rv-note").value
+    };
+    await api("/api/records/" + currentRecord.id + "/reviews", {method: "POST", body: JSON.stringify({data})});
+    await showRecord(currentRecord.id);
+    showOutput("复评已提交，等待复核岗确认；确认前原方案照常履约。");
+  } catch (e) { showError(e); }
+}
+
+async function decideReview(reviewId, decision) {
+  try {
+    const note = prompt("复核意见（可留空）", "") || "";
+    await api(`/api/records/${currentRecord.id}/reviews/${reviewId}/decision`, {method: "POST", body: JSON.stringify({decision, note})});
+    await showRecord(currentRecord.id);
+    showOutput(decision === "confirmed" ? "已确认该复评建议。" : "已驳回该复评建议。");
+  } catch (e) { showError(e); }
+}
+
+function renderAudit(items) {
+  $("audit").innerHTML = "<ul class='timeline'>" + items.map(e =>
+    `<li>${esc(e.created_at)} — <b>${esc(e.action)}</b>（${esc(e.actor_id)}）：${esc(e.details && e.details.summary || JSON.stringify(e.details))}</li>`).join("") + "</ul>";
+}
+
+async function seedDemo() {
+  try {
+    const data = {borrower_id: "B" + Date.now(), monthly_income: 18000, monthly_expenses: 9000, monthly_payment: 7000, arrears: 12000, hardship_factor: 0.5, program_type: "reduction", requested_months: 9};
+    let record = await api("/api/records", {method: "POST", body: JSON.stringify({reference: "DEMO-" + Date.now(), data})});
+    const steps = [["assess", {assessment_note: "收入波动"}], ["approve", {exception_approved: false}], ["activate", {borrower_ack: true}]];
+    for (const [action, payload] of steps) {
+      record = await api(`/api/records/${record.id}/actions/${action}`, {method: "POST", body: JSON.stringify({expected_version: record.version, data: payload})});
+    }
+    await loadRecords();
+    await showRecord(record.id);
+    showOutput("演示记录已创建并生效（active），可录入复评。注意：创建与审批需要 admin 角色。");
+  } catch (e) { showError(e); }
+}
+
+$("load").onclick = loadRecords;
+$("stats").onclick = async () => { try { showOutput(await api("/api/stats")); } catch (e) { showError(e); } };
+$("seed").onclick = seedDemo;
 </script>
 </body>
 </html>

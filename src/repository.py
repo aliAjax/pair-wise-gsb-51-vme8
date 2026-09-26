@@ -47,8 +47,28 @@ class Repository:
                     details TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    record_id INTEGER NOT NULL REFERENCES records(id) ON DELETE CASCADE,
+                    seq INTEGER NOT NULL,
+                    monthly_income REAL NOT NULL,
+                    household_expenses REAL NOT NULL,
+                    new_debt_payment REAL NOT NULL,
+                    approved_payment REAL NOT NULL,
+                    burden_ratio REAL,
+                    consecutive_high INTEGER NOT NULL,
+                    suggestion TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    decided_by TEXT,
+                    decided_at TEXT,
+                    decision_note TEXT
+                );
                 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state);
                 CREATE INDEX IF NOT EXISTS idx_audit_record ON audit_events(record_id, id);
+                CREATE INDEX IF NOT EXISTS idx_reviews_record ON reviews(record_id, id);
                 """
             )
 
@@ -125,6 +145,61 @@ class Repository:
                 "INSERT INTO audit_events(record_id,action,actor_id,version,details,created_at) VALUES(?,?,?,?,?,?)",
                 (record_id, action, actor_id, int(row["version"]), json.dumps(details, ensure_ascii=False, sort_keys=True), _now()),
             )
+
+    def add_review(self, record_id: int, data: Dict[str, Any], actor_id: str, assess) -> Dict[str, Any]:
+        """在单个事务内读取上一次复评、计算本次评估并写入，保证连续超限计数一致。"""
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT id FROM records WHERE id=?", (record_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("记录不存在")
+            last_row = connection.execute("SELECT * FROM reviews WHERE record_id=? ORDER BY id DESC LIMIT 1", (record_id,)).fetchone()
+            assessment = assess(dict(last_row) if last_row else None)
+            seq = int(connection.execute("SELECT COALESCE(MAX(seq),0)+1 AS seq FROM reviews WHERE record_id=?", (record_id,)).fetchone()["seq"])
+            cursor = connection.execute(
+                "INSERT INTO reviews(record_id,seq,monthly_income,household_expenses,new_debt_payment,approved_payment,burden_ratio,consecutive_high,suggestion,status,note,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    record_id, seq, data["monthly_income"], data["household_expenses"], data["new_debt_payment"],
+                    assessment["approved_payment"], assessment["burden_ratio"], assessment["consecutive_high"],
+                    assessment["suggestion"], "pending", data["note"], actor_id, now,
+                ),
+            )
+            result = connection.execute("SELECT * FROM reviews WHERE id=?", (int(cursor.lastrowid),)).fetchone()
+            connection.commit()
+        return dict(result)
+
+    def list_reviews(self, record_id: int) -> List[Dict[str, Any]]:
+        with self._connect() as connection:
+            rows = connection.execute("SELECT * FROM reviews WHERE record_id=? ORDER BY id", (record_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_review(self, review_id: int) -> Dict[str, Any]:
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+        if row is None:
+            raise NotFound("复评记录不存在")
+        return dict(row)
+
+    def decide_review(self, review_id: int, decision: str, actor_id: str, note: str) -> Dict[str, Any]:
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT status FROM reviews WHERE id=?", (review_id,)).fetchone()
+            if row is None:
+                connection.rollback()
+                raise NotFound("复评记录不存在")
+            if row["status"] != "pending":
+                connection.rollback()
+                raise Conflict("该复评已完成复核，不能重复处理")
+            connection.execute(
+                "UPDATE reviews SET status=?,decided_by=?,decided_at=?,decision_note=? WHERE id=?",
+                (decision, actor_id, now, note, review_id),
+            )
+            result = connection.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+            connection.commit()
+        return dict(result)
 
     def audit_timeline(self, record_id: int) -> List[Dict[str, Any]]:
         self.get(record_id)
